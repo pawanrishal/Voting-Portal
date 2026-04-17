@@ -17,7 +17,7 @@ ADMIN_PASSWORD = "admin123"
 DB_FILE = "votes.db"
 
 def init_database():
-    """Initialize the database with votes and candidates tables"""
+    """Initialize the database with votes, candidates and voters tables"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -30,25 +30,75 @@ def init_database():
         CREATE TABLE IF NOT EXISTS votes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_id INTEGER NOT NULL,
+            voter_code TEXT UNIQUE NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (candidate_id) REFERENCES candidates(id)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS voters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            name TEXT,
+            has_voted INTEGER NOT NULL DEFAULT 0
         )
     ''')
     conn.commit()
     conn.close()
 
-def ensure_two_candidates():
-    """Ensure exactly 2 candidate slots exist"""
+
+def ensure_votes_schema():
+    """Enable voter_code uniqueness for existing votes table"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM candidates')
-    count = c.fetchone()[0]
-    
-    if count == 0:
-        c.execute('INSERT INTO candidates (name) VALUES (?)', ("Rajat Upadhaya",))
-        c.execute('INSERT INTO candidates (name) VALUES (?)', ("Bidan Dev",))
-        conn.commit()
+    c.execute('PRAGMA table_info(votes)')
+    columns = [row[1] for row in c.fetchall()]
+    if 'voter_code' not in columns:
+        c.execute('ALTER TABLE votes ADD COLUMN voter_code TEXT')
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_votes_voter_code ON votes(voter_code)')
+    conn.commit()
     conn.close()
+
+def ensure_two_candidates():
+    """Ensure there are at least 2 candidate slots available"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name FROM candidates')
+    existing = [row[0] for row in c.fetchall()]
+
+    default_names = ["Candidate 1", "Candidate 2"]
+    for name in default_names:
+        if len(existing) >= 2:
+            break
+        if name not in existing:
+            c.execute('INSERT INTO candidates (name) VALUES (?)', (name,))
+            existing.append(name)
+
+    if len(existing) < 2 and not existing:
+        c.execute('INSERT INTO candidates (name) VALUES (?)', ("Candidate 1",))
+        c.execute('INSERT INTO candidates (name) VALUES (?)', ("Candidate 2",))
+
+    conn.commit()
+    conn.close()
+
+def add_candidate(name):
+    """Add a candidate to the database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO candidates (name) VALUES (?)', (name,))
+    conn.commit()
+    conn.close()
+
+
+def delete_candidate(candidate_id):
+    """Delete a candidate and its votes from the database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM votes WHERE candidate_id = ?', (candidate_id,))
+    c.execute('DELETE FROM candidates WHERE id = ?', (candidate_id,))
+    conn.commit()
+    conn.close()
+
 
 def update_candidate(candidate_id, name):
     """Update candidate name"""
@@ -57,6 +107,7 @@ def update_candidate(candidate_id, name):
     c.execute('UPDATE candidates SET name = ? WHERE id = ?', (name, candidate_id))
     conn.commit()
     conn.close()
+
 
 def get_candidates():
     """Get all candidates from the database"""
@@ -67,13 +118,53 @@ def get_candidates():
     conn.close()
     return results
 
-def add_vote(candidate_id):
+def add_vote(candidate_id, voter_code):
     """Add a vote to the database"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('INSERT INTO votes (candidate_id) VALUES (?)', (candidate_id,))
+    c.execute('INSERT INTO votes (candidate_id, voter_code) VALUES (?, ?)', (candidate_id, voter_code))
+    c.execute('UPDATE voters SET has_voted = 1 WHERE code = ?', (voter_code,))
     conn.commit()
     conn.close()
+
+
+def add_voter(code, name=None):
+    """Add an allowed voter code"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT OR IGNORE INTO voters (code, name) VALUES (?, ?)', (code, name))
+    conn.commit()
+    conn.close()
+
+
+def get_voter(code):
+    """Fetch a registered voter by code"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, code, name, has_voted FROM voters WHERE code = ?', (code,))
+    voter = c.fetchone()
+    conn.close()
+    return voter
+
+
+def delete_voter(code):
+    """Delete a registered voter code and any related vote"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM votes WHERE voter_code = ?', (code,))
+    c.execute('DELETE FROM voters WHERE code = ?', (code,))
+    conn.commit()
+    conn.close()
+
+
+def get_voters():
+    """Get all registered voter codes"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT code, name, has_voted FROM voters ORDER BY id')
+    results = c.fetchall()
+    conn.close()
+    return results
 
 def get_vote_counts():
     """Get vote counts for all candidates"""
@@ -96,6 +187,7 @@ def reset_votes():
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute('DELETE FROM votes')
+        c.execute('UPDATE voters SET has_voted = 0')
         conn.commit()
         conn.close()
 
@@ -113,6 +205,7 @@ def reset_all():
 
 # Initialize database
 init_database()
+ensure_votes_schema()
 ensure_two_candidates()
 
 # Initialize session state variables
@@ -147,25 +240,98 @@ else:
     
     # Candidate Management
     st.sidebar.subheader("👥 Set Candidate Names")
+    st.sidebar.info("Enter the candidate names for this election. Save to apply changes.")
     
     candidates_list = get_candidates()
-    
-    for cand_id, cand_name in candidates_list:
-        edited_name = st.sidebar.text_input(
-            f"Candidate {cand_id}:",
+    new_names = []
+    candidate_ids = []
+
+    for position, (cand_id, cand_name) in enumerate(candidates_list, start=1):
+        group = st.sidebar.container()
+        edited_name = group.text_input(
+            f"Candidate {position}:",
             value=cand_name,
-            key=f"candidate_{cand_id}"
+            key=f"candidate_{position}"
         )
-        
-        if edited_name != cand_name:
-            if st.sidebar.button(f"✅ Update Candidate {cand_id}", key=f"update_{cand_id}"):
-                if edited_name.strip():
-                    update_candidate(cand_id, edited_name.strip())
-                    st.sidebar.success("✅ Updated!")
-                    st.rerun()
-                else:
-                    st.sidebar.error("❌ Name cannot be empty!")
-    
+
+        if group.button("Delete", key=f"delete_{position}"):
+            if len(candidates_list) <= 1:
+                st.sidebar.error("❌ At least one candidate must remain.")
+            else:
+                delete_candidate(cand_id)
+                st.sidebar.success(f"✅ Candidate {position} deleted.")
+                st.rerun()
+
+        group.markdown("---")
+        new_names.append(edited_name)
+        candidate_ids.append(cand_id)
+
+    if st.sidebar.button("💾 Save Candidate Names", key="save_candidate_names"):
+        if all(name.strip() for name in new_names):
+            for cand_id, name in zip(candidate_ids, new_names):
+                update_candidate(cand_id, name.strip())
+            st.sidebar.success("✅ Candidate names saved!")
+            st.rerun()
+        else:
+            st.sidebar.error("❌ Candidate names cannot be empty!")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("➕ Add New Candidate")
+    new_candidate_name = st.sidebar.text_input(
+        "New candidate name:",
+        value="",
+        key="new_candidate_name"
+    )
+
+    if st.sidebar.button("Add Candidate", key="add_candidate"):
+        if new_candidate_name.strip():
+            try:
+                add_candidate(new_candidate_name.strip())
+                st.sidebar.success("✅ Candidate added successfully!")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.sidebar.error("❌ Candidate name must be unique.")
+        else:
+            st.sidebar.error("❌ Please enter a candidate name.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧾 Manage Voter Codes")
+    new_voter_code = st.sidebar.text_input(
+        "New voter code:",
+        value="",
+        key="new_voter_code"
+    )
+    new_voter_name = st.sidebar.text_input(
+        "Voter name (optional):",
+        value="",
+        key="new_voter_name"
+    )
+
+    if st.sidebar.button("Add Voter Code", key="add_voter_code"):
+        if new_voter_code.strip():
+            add_voter(new_voter_code.strip(), new_voter_name.strip() or None)
+            st.sidebar.success("✅ Voter code added successfully!")
+            st.rerun()
+        else:
+            st.sidebar.error("❌ Please enter a voter code.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Registered voter codes:**")
+    voters_list = get_voters()
+    if voters_list:
+        for position, (code, name, has_voted) in enumerate(voters_list, start=1):
+            group = st.sidebar.container()
+            badge = "✅ Voted" if has_voted else "⏳ Not voted"
+            display_name = f" — {name}" if name else ""
+            group.write(f"**{position}.** `{code}`{display_name} {badge}")
+            if group.button("Delete", key=f"delete_voter_{position}"):
+                delete_voter(code)
+                st.sidebar.success(f"✅ Voter code `{code}` deleted.")
+                st.rerun()
+            group.markdown("---")
+    else:
+        st.sidebar.info("No voter codes registered yet. Add codes before voting.")
+
     st.sidebar.markdown("---")
     
     # Reset votes button - only visible to admin
@@ -202,6 +368,9 @@ if not st.session_state.is_admin:
     # Create a mapping of candidate names to IDs
     candidate_dict = {name: cand_id for cand_id, name in candidates_list}
     candidate_names = [name for _, name in candidates_list]
+
+    voters_list = get_voters()
+    voter_code = st.text_input("Enter your voter code:", key="voter_code")
     
     # Radio button for candidate selection
     selected_candidate = st.radio(
@@ -214,12 +383,26 @@ if not st.session_state.is_admin:
     col1, col2 = st.columns([1, 3])
     with col1:
         if st.button("Submit Vote", key="submit_vote", use_container_width=True):
-            if selected_candidate:
-                candidate_id = candidate_dict[selected_candidate]
-                add_vote(candidate_id)
-                st.session_state.voted = True
-                st.session_state.confirmation_message = f"Your vote for {selected_candidate} has been recorded."
-                st.rerun()
+            if not voter_code.strip():
+                st.error("❌ Please enter your voter code before voting.")
+            elif not voters_list:
+                st.error("❌ Voting is not available because no voter codes are registered yet.")
+            elif selected_candidate:
+                code = voter_code.strip()
+                voter = get_voter(code)
+                if not voter:
+                    st.error("❌ Invalid voter code. Please enter a valid registered code.")
+                elif voter[3] == 1:
+                    st.error("❌ This voter code has already been used.")
+                else:
+                    candidate_id = candidate_dict[selected_candidate]
+                    try:
+                        add_vote(candidate_id, code)
+                        st.session_state.voted = True
+                        st.session_state.confirmation_message = f"Your vote for {selected_candidate} has been recorded."
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("❌ This voter code has already been used.")
 
     # Display confirmation message
     if st.session_state.voted and st.session_state.confirmation_message:
@@ -237,12 +420,12 @@ else:
     vote_results = get_vote_counts()
     total_votes = sum(count for _, count in vote_results)
 
-    # Display vote counts using metrics in columns
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(vote_results[0][0], vote_results[0][1], delta=None)
-    with col2:
-        st.metric(vote_results[1][0], vote_results[1][1], delta=None)
+    # Display vote counts for all candidates
+    if vote_results:
+        for name, count in vote_results:
+            st.metric(name, count, delta=None)
+    else:
+        st.write("No candidates available.")
 
     st.markdown(f"**Total Votes Recorded:** {total_votes}")
 
